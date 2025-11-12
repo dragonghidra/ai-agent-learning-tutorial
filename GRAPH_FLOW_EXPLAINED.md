@@ -1,5 +1,8 @@
 Here’s what that LangGraph snippet is doing, piece by piece, and how execution flows when you run the compiled graph.
 
+<img width="1024" height="1536" alt="FB7F2CDD-6E20-47BA-966F-30D753981067" src="https://github.com/user-attachments/assets/d63741af-1ba5-4247-b4f9-af6200d0c17e" />
+
+
 What you built
 	•	State type: StateGraph(MessagesState)
 The graph’s shared state is a dict-like object whose key of interest is messages. With MessagesState, new messages are appended rather than overwriting the list. That means every node sees the full conversation so far and returns a patch (e.g., more messages) that gets merged into state.
