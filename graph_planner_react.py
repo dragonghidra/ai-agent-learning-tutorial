@@ -5,9 +5,10 @@ import argparse
 import json
 import os
 import threading
+import concurrent.futures  # parallel worker pool (kept for optional future use)
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Literal
+from typing import Any, Literal, List, Optional, Dict
 
 import requests
 
@@ -16,7 +17,8 @@ from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
-from langchain_core.messages import BaseMessage, HumanMessage
+from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 # --------- Real tools (they perform actual HTTP requests) ----------
 
@@ -33,7 +35,7 @@ _TEXT_MIME_EXTRAS = {
 }
 
 
-def _looks_textual(content_type: str | None) -> bool:
+def _looks_textual(content_type: Optional[str]) -> bool:
     if not content_type:
         return True
     mime = content_type.split(";", 1)[0].strip().lower()
@@ -52,7 +54,7 @@ def http_get(url: str) -> str:
 
         resp.encoding = resp.encoding or resp.apparent_encoding or "utf-8"
         remaining = HTTP_MAX_RESPONSE_CHARS
-        chunks: list[str] = []
+        chunks: List[str] = []
         for chunk in resp.iter_content(chunk_size=8192, decode_unicode=True):
             if not chunk:
                 continue
@@ -173,38 +175,226 @@ def get_weather(location: str, units: Literal["us", "metric"] = "us") -> str:
 TOOLS = [http_get, get_weather]
 tool_node = ToolNode(TOOLS)  # Executes one or more tool calls emitted by the LLM
 
-# --------- Real LLM (tool-calling enabled) ----------
+# --------- Real LLMs ----------
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Set OPENAI_API_KEY in your environment before running this script.")
 
+# Worker LLM (tool-calling)
 llm = ChatOpenAI(
     model="gpt-5-nano",
     temperature=0,
     api_key=OPENAI_API_KEY,
 ).bind_tools(TOOLS)
 
+# Planner LLM (no tools)
+planner_llm = ChatOpenAI(
+    model="gpt-5-nano",
+    temperature=0,
+    api_key=OPENAI_API_KEY,
+)
+
+# --------- Worker agent (same loop as your starter) ----------
+
 def agent(state: MessagesState):
-    """Single LLM step. Returns an AIMessage that may include tool_calls."""
+    """Single LLM step for a worker. Returns an AIMessage that may include tool_calls."""
     resp = llm.invoke(state["messages"])
     return {"messages": [resp]}
 
-# --------- Graph wiring (model <-> tools loop) ----------
+worker_workflow = StateGraph(MessagesState)
+worker_workflow.add_node("agent", agent)
+worker_workflow.add_node("tools", tool_node)
+worker_workflow.add_edge(START, "agent")
+worker_workflow.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
+worker_workflow.add_edge("tools", "agent")
+worker_graph = worker_workflow.compile()  # compiled worker
 
-workflow = StateGraph(MessagesState)
-workflow.add_node("agent", agent)
-workflow.add_node("tools", tool_node)
+# --------- Planning schema & node ----------
 
-workflow.add_edge(START, "agent")
-# Decide: if the AI's last message contains tool_calls -> run tools, else END
-workflow.add_conditional_edges("agent", tools_condition, { "tools": "tools", END: END })
-# After running tools, go back to the model to read & use tool results
-workflow.add_edge("tools", "agent")
+class PlanStep(BaseModel):
+    id: str = Field(..., description="Short unique id: 'step1', 'weather_sf', etc.")
+    description: str = Field(..., description="What a worker should do with available tools.")
 
-graph = workflow.compile()
+class Plan(BaseModel):
+    mode: Literal["single", "sequential", "parallel"] = Field(
+        ..., description="Pick 'single', 'sequential', or 'parallel'."
+    )
+    steps: List[PlanStep] = Field(..., description="1–8 concrete steps.")
 
-# --------- Runtime helpers & interactive entrypoints ---------
+
+def _extract_plan_payload(message: Optional[BaseMessage]) -> Optional[Dict[str, Any]]:
+    """Best-effort extraction of planner JSON regardless of how it was stored."""
+    if not message:
+        return None
+    extras = getattr(message, "additional_kwargs", None) or {}
+    plan_payload = extras.get("plan")
+    if isinstance(plan_payload, dict):
+        return plan_payload
+    content = getattr(message, "content", None)
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and "steps" in block:
+                return block
+    if isinstance(content, str):
+        try:
+            decoded = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(decoded, dict):
+            return decoded
+    return None
+
+# Use structured output for reliable JSON
+planner = planner_llm.with_structured_output(Plan)
+
+PLANNER_SYSTEM = SystemMessage(
+    content=(
+        "You are a planning agent. Read the user's goal and design a minimal plan the workers can execute. "
+        "Workers can: (1) fetch web pages with http_get(url), (2) get current weather with get_weather(location, units). "
+        "Choose mode: 'single' if one step suffices, 'sequential' if steps depend on each other, "
+        "'parallel' if steps are independent and can run concurrently. Keep steps crisp and tool-friendly."
+    )
+)
+
+def planning_node(state: MessagesState):
+    # Find last user request
+    user_msgs = [m for m in state["messages"] if getattr(m, "type", None) == "human"]
+    last_user = user_msgs[-1] if user_msgs else HumanMessage(content="Do something useful.")
+    plan = planner.invoke([PLANNER_SYSTEM, last_user])
+    plan_dict = plan.model_dump()
+    # Attach the plan as an AI message named 'planner' so the executor can find it
+    plan_msg = AIMessage(
+        name="planner",
+        content=ensure_message_content(plan_dict),
+        additional_kwargs={"plan": plan_dict},
+    )
+    return {"messages": [plan_msg]}
+
+# --------- Helpers ----------
+
+def _extract_final_ai(messages: List[BaseMessage]) -> Optional[AIMessage]:
+    final_ai = None
+    for msg in messages:
+        if getattr(msg, "type", None) == "ai":
+            final_ai = msg
+    return final_ai
+
+def _run_worker_for_step(step: PlanStep, user_context: HumanMessage, extra_context: Optional[List[BaseMessage]] = None):
+    """Invoke the worker graph for a single step."""
+    sys = SystemMessage(
+        content=(
+            "You are a focused worker agent. Only complete the assigned step using available tools. "
+            "Be concise, but include the essential details and any URLs you used verbatim."
+        )
+    )
+    task_msg = HumanMessage(name=f"task:{step.id}", content=f"Step: {step.description}")
+    messages = [sys, user_context, task_msg]
+    if extra_context:
+        messages.extend(extra_context)
+    result = worker_graph.invoke({"messages": messages})
+    return _extract_final_ai(result["messages"])
+
+# --------- NEW: ReAct Executor (agent keeps deciding to use more tools until done) ----------
+
+# Dedicated executor LLM bound to tools
+executor_llm = ChatOpenAI(
+    model="gpt-5-nano",
+    temperature=0,
+    api_key=OPENAI_API_KEY,
+).bind_tools(TOOLS)
+
+EXECUTOR_SYSTEM = SystemMessage(
+    content=(
+        "You are the EXECUTOR. Follow the provided plan as a guide and use ReAct:\n"
+        "Think about what to do next, choose a tool if needed, observe the result, and repeat until you can answer.\n"
+        "Available tools: http_get(url) for fetching pages; get_weather(location, units) for current weather.\n"
+        "You may call tools multiple times. Stop calling tools when you have enough information.\n"
+        "When finished, reply with a concise, user-ready answer. Do not include internal chain-of-thought."
+    )
+)
+
+def executor_agent(state: MessagesState):
+    """One step of the executor (tool-capable)."""
+    resp = executor_llm.invoke(state["messages"])
+    return {"messages": [resp]}
+
+# ReAct loop for the executor: agent -> (tools?) -> agent ... until done
+executor_workflow = StateGraph(MessagesState)
+executor_workflow.add_node("agent", executor_agent)
+executor_workflow.add_node("tools", tool_node)
+executor_workflow.add_edge(START, "agent")
+executor_workflow.add_conditional_edges("agent", tools_condition, {"tools": "tools", END: END})
+executor_workflow.add_edge("tools", "agent")
+executor_graph = executor_workflow.compile()
+
+# --------- Execution node (uses ReAct executor) ----------
+
+def execution_node(state: MessagesState):
+    """
+    Read the most recent planner output and then run a ReAct loop that keeps deciding
+    whether to use more tools until the model stops emitting tool calls.
+    """
+    # Locate the latest plan emitted by the planner
+    plan_msg = None
+    for msg in reversed(state["messages"]):
+        if getattr(msg, "type", None) == "ai" and getattr(msg, "name", "") == "planner":
+            plan_msg = msg
+            break
+
+    # Last user message for grounding
+    user_msgs = [m for m in state["messages"] if getattr(m, "type", None) == "human"]
+    last_user = user_msgs[-1] if user_msgs else HumanMessage(content="Do something useful.")
+
+    # If for any reason the planner isn't present, fall back to a single worker run on the user prompt.
+    plan_payload = _extract_plan_payload(plan_msg)
+    if not plan_msg or not plan_payload:
+        fallback_step = PlanStep(id="direct", description=last_user.content)
+        final = _run_worker_for_step(fallback_step, last_user)
+        summary = final.content if final else "No result."
+        return {"messages": [AIMessage(name="executor", content=summary)]}
+
+    # Seed the ReAct executor with a system prompt, the user's request, and the plan as context.
+    # NOTE: We pass these into a *subgraph*; we will return only the newly created messages,
+    # so we don't duplicate context in the outer transcript.
+    plan_context = AIMessage(
+        name="planner",
+        content=plan_msg.content,
+        additional_kwargs={"plan": plan_payload},
+    )
+
+    seeded_messages: List[BaseMessage] = [
+        EXECUTOR_SYSTEM,
+        last_user,
+        plan_context,
+    ]
+
+    # Run the ReAct loop inside the subgraph
+    sub_result = executor_graph.invoke({"messages": seeded_messages})
+
+    # Only return messages created by the subgraph *after* our seeds, so outer history stays clean.
+    produced = sub_result["messages"][len(seeded_messages):]
+
+    # Safety fallback: if nothing was produced (unlikely), return a basic executor message.
+    if not produced:
+        return {"messages": [AIMessage(name="executor", content="No result.")]}
+
+    return {"messages": produced}
+
+# --------- Controller graph (planner -> ReAct executor) ----------
+
+controller = StateGraph(MessagesState)
+controller.add_node("plan", planning_node)
+controller.add_node("execute", execution_node)
+controller.add_edge(START, "plan")
+controller.add_edge("plan", "execute")
+controller.add_edge("execute", END)
+controller_graph = controller.compile()
+
+# For the rest of the program, we expose this as `graph`
+graph = controller_graph
+
+# --------- Runtime helpers & interactive entrypoints (unchanged) ---------
 
 CLI_READY = threading.Event()
 API_HOST = os.environ.get("WEATHER_AGENT_API_HOST", "127.0.0.1")
@@ -234,7 +424,7 @@ def make_json_safe(value: Any):
 
 
 def ensure_message_content(value: Any):
-    """Return content in the str-or-list format expected by LangChain messages."""
+    """Return a value that satisfies LangChain's str-or-list content rule."""
     if isinstance(value, str):
         return value
     if isinstance(value, list) and all(isinstance(item, (str, dict)) for item in value):
@@ -369,7 +559,7 @@ def print_message(message):
         print(f"{tool_label} {stringify_content(tc)}")
 
 
-def _extract_final_ai(messages):
+def _extract_final_ai_global(messages):
     final_ai = None
     for msg in messages:
         if getattr(msg, "type", None) == "ai":
@@ -396,7 +586,7 @@ def display_responses(messages, *, streamer=None, session_id=None, verbose=None)
                 streamer.message(msg, session_id=session_id)
         return
 
-    final_ai = _extract_final_ai(messages)
+    final_ai = _extract_final_ai_global(messages)
     if final_ai:
         _print_pretty_ai(final_ai)
         if streamer is not None:
@@ -417,8 +607,8 @@ def reprint_prompt():
 def run_cli_chat(conversation: ConversationManager, stop_event: threading.Event):
     """Interactive multi-turn chat loop in the terminal."""
     cli_ui.print_banner(
-        "LangGraph Weather",
-        "LangGraph agent with real tool calls and optional verbose traces.",
+        "LangGraph Planner + ReAct Executor",
+        "Planner generates a plan; executor loops with tools until done.",
     )
     cli_ui.print_status("Type 'exit' or 'quit' to leave. Use --verbose for tool traces.", kind="info")
     CLI_READY.set()
@@ -535,7 +725,7 @@ def start_background_api(conversation: ConversationManager, host: str, port: int
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="LangGraph weather agent CLI.")
+    parser = argparse.ArgumentParser(description="LangGraph planner+executor (ReAct) CLI.")
     parser.add_argument(
         "--verbose",
         action="store_true",

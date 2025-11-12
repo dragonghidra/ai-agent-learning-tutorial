@@ -19,12 +19,58 @@ from langchain_core.messages import BaseMessage, HumanMessage
 
 # --------- Real tools (they perform actual HTTP requests) ----------
 
+HTTP_MAX_RESPONSE_CHARS = int(os.environ.get("HTTP_TOOL_MAX_CHARS", "120000"))
+HTTP_USER_AGENT = os.environ.get(
+    "HTTP_TOOL_USER_AGENT", "LangGraphWeatherAgent/1.0 (+https://github.com/bo)"
+)
+_TEXT_MIME_PREFIXES = ("text/",)
+_TEXT_MIME_EXTRAS = {
+    "application/json",
+    "application/xml",
+    "application/xhtml+xml",
+    "application/javascript",
+}
+
+
+def _looks_textual(content_type: str | None) -> bool:
+    if not content_type:
+        return True
+    mime = content_type.split(";", 1)[0].strip().lower()
+    return mime in _TEXT_MIME_EXTRAS or any(mime.startswith(p) for p in _TEXT_MIME_PREFIXES)
+
+
 @tool
 def http_get(url: str) -> str:
-    """Fetch a URL and return its text response."""
-    resp = requests.get(url, timeout=15)
-    resp.raise_for_status()
-    return resp.text
+    """Fetch a URL and return (at most) HTTP_MAX_RESPONSE_CHARS of text."""
+    headers = {"User-Agent": HTTP_USER_AGENT}
+    with requests.get(url, timeout=15, headers=headers, stream=True) as resp:
+        resp.raise_for_status()
+        if not _looks_textual(resp.headers.get("Content-Type")):
+            ctype = resp.headers.get("Content-Type", "unknown")
+            return f"Unsupported content type '{ctype}'. Only text responses are returned."
+
+        resp.encoding = resp.encoding or resp.apparent_encoding or "utf-8"
+        remaining = HTTP_MAX_RESPONSE_CHARS
+        chunks: list[str] = []
+        for chunk in resp.iter_content(chunk_size=8192, decode_unicode=True):
+            if not chunk:
+                continue
+            if len(chunk) > remaining:
+                chunks.append(chunk[:remaining])
+                remaining = 0
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+            if remaining <= 0:
+                break
+
+    body = "".join(chunks).strip()
+    if not body:
+        return "[Empty response]"
+
+    if remaining <= 0:
+        body += f"\n\n[Truncated to first {HTTP_MAX_RESPONSE_CHARS:,} characters]"
+    return body
 
 
 @tool
@@ -172,6 +218,18 @@ def make_json_safe(value: Any):
     return value
 
 
+def ensure_message_content(value: Any):
+    """Return content that satisfies the str-or-list constraint for LangChain messages."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(isinstance(item, (str, dict)) for item in value):
+        return value
+    try:
+        return json.dumps(make_json_safe(value), ensure_ascii=False)
+    except TypeError:
+        return str(value)
+
+
 SSE_FORCE = env_flag("WEATHER_AGENT_FORCE_SSE")
 IDE_INTEGRATION = env_flag("ENABLE_IDE_INTEGRATION")
 SSE_PORT_PRESENT = bool(os.environ.get("CLAUDE_CODE_SSE_PORT"))
@@ -250,7 +308,7 @@ class ConversationManager:
         """Run the agent while holding the manager lock until responses are consumed."""
 
         with self._lock:
-            self.history.append(HumanMessage(content=content, name=source))
+            self.history.append(HumanMessage(content=ensure_message_content(content), name=source))
             reply_start = len(self.history)
             result = self.agent.invoke({"messages": self.history})
             messages = result.get("messages") if isinstance(result, dict) else None
